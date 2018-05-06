@@ -10,6 +10,8 @@ import android.content.Context;
 import android.content.OperationApplicationException;
 import android.content.UriMatcher;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteConstraintException;
+import android.database.sqlite.SQLiteCursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteException;
 import android.net.Uri;
@@ -26,6 +28,7 @@ public abstract class AbstractProvider extends ContentProvider {
     protected final String mLogTag;
     protected SQLiteDatabase mDatabase;
     public static final String QUERY_CALLER_IS_SYNC_ADAPTER = "caller_is_sync_adapter";
+    public static final String QUERY_CONFLICT_ALGORITHM = "conflictAlgorithm";
     private static final String PARAM_TRUE = "1";
     protected final Object mMatcherSynchronizer;
     protected UriMatcher mMatcher;
@@ -90,25 +93,28 @@ public abstract class AbstractProvider extends ContentProvider {
                     String tableName = Utils.getTableName(clazz, table);
                     String mimeName = Utils.getMimeName(clazz, table);
 
-                    // Add the plural version
-                    mMatcher.addURI(authority, tableName, details.size());
-                    details.add(new MatchDetail(tableName, "vnd.android.cursor.dir/vnd." + getAuthority() + "." + mimeName, null));
-
-                    // Add the singular version
-                    mMatcher.addURI(authority, tableName + "/#", details.size());
-                    details.add(new MatchDetail(tableName, "vnd.android.cursor.item/vnd." + getAuthority() + "." + mimeName,  new ForcedColumn(BaseColumns._ID, 1)));
+                    List<String> uniqueColumnsBuilder = new ArrayList<>();
+                    List<String> foreignKeyUris = new ArrayList<>();
+                    List<ForcedColumn> foreignKeyColumns = new ArrayList<>();
 
                     // Add the hierarchical versions
                     for (Field field : clazz.getFields()) {
+                        Column column = field.getAnnotation(Column.class);
+                        if(column == null) {
+                            continue;
+                        }
+
+                        if(column.unique()) {
+                            try {
+                                uniqueColumnsBuilder.add(field.get(null).toString());
+                            } catch (IllegalAccessException e) {
+                                throw new IllegalArgumentException("Can't read the field name, needs to be static");
+                            }
+                        }
 
                         ForeignKey foreignKey = field.getAnnotation(ForeignKey.class);
 
                         if(foreignKey == null) {
-                            continue;
-                        }
-
-                        Column column = field.getAnnotation(Column.class);
-                        if(column == null) {
                             continue;
                         }
 
@@ -131,8 +137,23 @@ public abstract class AbstractProvider extends ContentProvider {
                         }
 
                         String nestedUri = parentTableName + "/#/" + tableName;
-                        mMatcher.addURI(authority, nestedUri, details.size());
-                        details.add(new MatchDetail(tableName, "vnd.android.cursor.dir/vnd." + getAuthority() + "." + mimeName, new ForcedColumn(foreignKeyColumn, 1)));
+                        foreignKeyUris.add(nestedUri);
+                        foreignKeyColumns.add(new ForcedColumn(foreignKeyColumn, 1));
+                    }
+
+                    String[] uniqueColumns = uniqueColumnsBuilder.toArray(new String[uniqueColumnsBuilder.size()]);
+
+                    // Add the plural version
+                    mMatcher.addURI(authority, tableName, details.size());
+                    details.add(new MatchDetail(tableName, "vnd.android.cursor.dir/vnd." + getAuthority() + "." + mimeName, null, uniqueColumns));
+
+                    // Add the singular version
+                    mMatcher.addURI(authority, tableName + "/#", details.size());
+                    details.add(new MatchDetail(tableName, "vnd.android.cursor.item/vnd." + getAuthority() + "." + mimeName,  new ForcedColumn(BaseColumns._ID, 1), uniqueColumns));
+
+                    for(int i = 0; i < foreignKeyUris.size(); i++) {
+                        mMatcher.addURI(authority, foreignKeyUris.get(i), details.size());
+                        details.add(new MatchDetail(tableName, "vnd.android.cursor.dir/vnd." + getAuthority() + "." + mimeName, foreignKeyColumns.get(i), uniqueColumns));
                     }
                 }
             }
@@ -147,11 +168,13 @@ public abstract class AbstractProvider extends ContentProvider {
         public final String tableName;
         public final String mimeType;
         public final ForcedColumn forcedColumn;
+        public final String[] uniqueColumns;
 
-        public MatchDetail(String tableName, String mimeType, ForcedColumn forcedColumn) {
+        public MatchDetail(String tableName, String mimeType, ForcedColumn forcedColumn, String[] uniqueColumns) {
             this.tableName = tableName;
             this.mimeType = mimeType;
             this.forcedColumn = forcedColumn;
+            this.uniqueColumns = uniqueColumns;
         }
     }
 
@@ -249,6 +272,16 @@ public abstract class AbstractProvider extends ContentProvider {
 
         SelectionBuilder builder = new SelectionBuilder(detail.tableName);
 
+        int conflictAlgorithm = SQLiteDatabase.CONFLICT_NONE;
+
+        String serializedConflictAlgorithm = uri.getQueryParameter(QUERY_CONFLICT_ALGORITHM);
+
+        if(serializedConflictAlgorithm != null) {
+            conflictAlgorithm = Integer.parseInt(serializedConflictAlgorithm);
+        }
+
+        builder.setConflictAlgorithm(conflictAlgorithm);
+
         List<String> segments = uri.getPathSegments();
         if(detail.forcedColumn != null) {
             builder.whereEquals(detail.forcedColumn.columnName, segments.get(detail.forcedColumn.pathSegment));
@@ -274,7 +307,30 @@ public abstract class AbstractProvider extends ContentProvider {
             values.put(detail.forcedColumn.columnName, Long.parseLong(uri.getPathSegments().get(detail.forcedColumn.pathSegment)));
         }
 
-        long rowId = mDatabase.insert(detail.tableName, null, values);
+        int conflictAlgorithm = SQLiteDatabase.CONFLICT_NONE;
+
+        String serializedConflictAlgorithm = uri.getQueryParameter(QUERY_CONFLICT_ALGORITHM);
+
+        if(serializedConflictAlgorithm != null) {
+            conflictAlgorithm = Integer.parseInt(serializedConflictAlgorithm);
+        }
+
+        // if we have ignore specified as a conflict strategy, attempt to insert the row,
+        // but make it fail (without rollback) and in that case search for the correct value.
+        // This is all to work around: https://code.google.com/p/android/issues/detail?id=13045
+        // and here: http://stackoverflow.com/questions/13391915/why-does-insertwithonconflict-conflict-ignore-return-1-error
+
+        long rowId = -1;
+
+        try {
+            rowId = mDatabase.insertWithOnConflict(detail.tableName, null, values, conflictAlgorithm == SQLiteDatabase.CONFLICT_IGNORE
+                    ? SQLiteDatabase.CONFLICT_ABORT
+                    : conflictAlgorithm);
+        } catch(SQLiteConstraintException sce) {
+            if(conflictAlgorithm == SQLiteDatabase.CONFLICT_NONE) {
+                throw sce;
+            }
+        }
 
         if (rowId > -1) {
             boolean syncToNetwork = !PARAM_TRUE.equals(uri.getQueryParameter(QUERY_CALLER_IS_SYNC_ADAPTER));
@@ -288,6 +344,45 @@ public abstract class AbstractProvider extends ContentProvider {
             }
 
             return ContentUris.withAppendedId(canonical, rowId);
+        } else if(conflictAlgorithm == SQLiteDatabase.CONFLICT_IGNORE) {
+            // see: https://code.google.com/p/android/issues/detail?id=13045
+
+            SelectionBuilder builder = new SelectionBuilder(detail.tableName);
+
+            if(detail.forcedColumn != null) {
+                builder.whereEquals(detail.forcedColumn.columnName, uri.getPathSegments().get(detail.forcedColumn.pathSegment));
+            }
+
+            for(int i = 0; i < detail.uniqueColumns.length; i++) {
+                if(values.containsKey(detail.uniqueColumns[i])) {
+                    builder.whereEquals(detail.uniqueColumns[i], values.getAsString(detail.uniqueColumns[i]));
+                }
+            }
+
+            Cursor result = null;
+            try {
+                result = builder.query(mDatabase, new String[] {BaseColumns._ID}, null);
+                if(!result.moveToFirst()) {
+                    return null;
+                }
+
+                if(result.getCount() != 1) {
+                    return null;
+                }
+
+                int idColumnIndex = result.getColumnIndex(BaseColumns._ID);
+
+                rowId = result.getLong(idColumnIndex);
+                Uri canonical = Uri.parse("content://" + getAuthority() + "/" + detail.tableName);
+                return ContentUris.withAppendedId(canonical, rowId);
+            } finally {
+                if(result != null) {
+                    result.close();
+                }
+            }
+            // ensure that the match detail has the list of unique columns for that table
+            // convert the list of values provided to just those with unique constraints
+            // then select the row id from the table with those constraints.
         }
 
         return null;

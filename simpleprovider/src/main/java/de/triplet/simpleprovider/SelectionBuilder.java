@@ -47,6 +47,8 @@ public class SelectionBuilder {
 
     private ArrayList<String> mSelectionArgs = new ArrayList<String>();
 
+    private int mConflictAlgorithm = SQLiteDatabase.CONFLICT_NONE;
+
     public SelectionBuilder(String table) {
         mTable = table;
     }
@@ -57,7 +59,12 @@ public class SelectionBuilder {
     public SelectionBuilder reset() {
         mSelection.setLength(0);
         mSelectionArgs.clear();
+        mConflictAlgorithm = SQLiteDatabase.CONFLICT_NONE;
         return this;
+    }
+
+    public void setConflictAlgorithm(int conflictAlgorithm) {
+        this.mConflictAlgorithm = conflictAlgorithm;
     }
 
     /**
@@ -172,7 +179,7 @@ public class SelectionBuilder {
      */
     public int update(SQLiteDatabase db, ContentValues values) {
         assertTable();
-        return db.update(mTable, values, getSelection(), getSelectionArgs());
+        return db.updateWithOnConflict(mTable, values, getSelection(), getSelectionArgs(), mConflictAlgorithm);
     }
 
     /**
